@@ -1,0 +1,31 @@
+﻿
+    $hashes = @{}
+
+    foreach ($archivo in $archivos) {
+        if (Test-Path $archivo) {
+            $hashBytes = Get-FileHash -Path $archivo -Algorithm SHA256 | Select-Object -ExpandProperty Hash
+            $base64Hash = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($hashBytes))
+            $hashes[$archivo] = $base64Hash
+            Write-Host "Hash (Base64) de '$archivo': $base64Hash"
+        } else {
+            # Write-Warning por defecto envÃ­a a la corriente de error, no a la de Ã©xito.
+            # Para capturarlo en Out-File, se puede redirigir o usar Write-Host en su lugar.
+            # AquÃ­ lo cambiamos a Write-Host para que aparezca en el archivo.
+            Write-Host "AVISO: El archivo '$archivo' no existe y serÃ¡ omitido. AsegÃºrate de que los archivos estÃ©n 
+en el mismo directorio donde ejecutas PowerShell o proporciona la ruta completa."
+        }
+    }
+
+    Write-Host "`n--- ComparaciÃ³n de Hashes ---`n"
+
+    $valoresHashes = $hashes.Values | Select-Object -Unique
+
+    if ($valoresHashes.Count -eq 1) {
+        Write-Host "Â¡Excelente! Todos los archivos (peer.py, peer_node2.py, peer_node3.py) tienen el **mismo hash 
+Base64**."
+    } else {
+        Write-Host "AtenciÃ³n: Los archivos tienen **diferentes hashes Base64**."
+        Write-Host "Hashes Ãºnicos encontrados:"
+        $valoresHashes | ForEach-Object { Write-Host "- $_" }
+    }
+
