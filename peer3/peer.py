@@ -4,7 +4,7 @@ import os
 import json
 import sys
 import time
-import shutil # Importar shutil para la copia de archivos
+import shutil
 
 CHUNK_SIZE = 1024 * 1024  # Tamaño de los fragmentos (1 MB)
 tracker_ip = "127.0.0.1" # Valor por defecto, se sobrescribe con argumentos
@@ -16,6 +16,11 @@ node_shared_files_db = "node_shared_files.json" # Archivo para guardar la lista 
 current_node_id = None
 current_node_port = None
 current_shared_files = [] # Esta lista se cargará/guardará y contendrá solo nombres de archivo
+
+# Diccionario para almacenar el progreso de descargas activas
+# {file_name: {"total_fragments": int, "completed_fragments": int, "total_size": int, "downloaded_size": int, "status": str}}
+active_downloads_progress = threading.Lock() # Bloqueo para acceder a este diccionario de forma segura
+global_download_status = {} # Estado de descargas para el menú
 
 
 def load_shared_files():
@@ -38,7 +43,7 @@ def save_shared_files(files_list):
     """Guarda la lista de nombres de archivos compartidos en un archivo JSON."""
     peers_dir = os.path.join(os.getcwd(), "peers")
     if not os.path.exists(peers_dir):
-        os.makedirs(peers_dir) # Asegurarse de que la carpeta 'peers' exista
+        os.makedirs(peers_dir)
     file_path = os.path.join(peers_dir, node_shared_files_db)
     try:
         with open(file_path, 'w') as f:
@@ -55,14 +60,15 @@ def register_with_tracker(node_id, node_port, files):
     tracker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         tracker.connect((tracker_ip, tracker_port))
-        # Asegurarse de que 'files' sea una lista de nombres de archivos
-        files_to_send = [f for f in files if f] # Filtrar cadenas vacías
-        tracker.send(f"REGISTER:{node_id}:{node_port}:{':'.join(files_to_send)}".encode())
-        response = tracker.recv(1024).decode()
+        files_to_send = [f for f in files if f]
+        # El tracker infiere la IP del peer de la conexión entrante (addr[0])
+        # Así que aquí solo enviamos el node_port, no la IP que detectamos
+        tracker.send(f"REGISTER:{node_id}:{node_port}:{':'.join(files_to_send)}".encode('utf-8'))
+        response = tracker.recv(1024).decode('utf-8')
         print(f"Tracker Response: {response}")
     except ConnectionRefusedError:
         print(f"[CRITICAL ERROR] No se pudo conectar al Tracker en {tracker_ip}:{tracker_port}. Asegúrate de que el Tracker esté en ejecución.")
-        sys.exit(1) # El peer no puede funcionar sin el tracker
+        sys.exit(1)
     except Exception as e:
         print(f"[CRITICAL ERROR] Error al registrar con el Tracker: {e}")
         sys.exit(1)
@@ -75,13 +81,17 @@ def request_file(file_name):
     """
     tracker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        tracker.settimeout(5) # Añadir timeout para la conexión al tracker
         tracker.connect((tracker_ip, tracker_port))
-        tracker.send(f"REQUEST:{file_name}".encode())
-        response = tracker.recv(4096).decode()
+        tracker.send(f"REQUEST:{file_name}".encode('utf-8'))
+        response = tracker.recv(4096).decode('utf-8')
         if response.startswith("ERROR"):
             print(f"[ERROR] Tracker devolvió error al solicitar archivo: {response}")
             return []
-        return [p for p in response.split(",") if p] # Retorna una lista de nodos en formato 'node_id:ip:port', filtrando vacíos
+        return [p for p in response.split(",") if p]
+    except socket.timeout:
+        print(f"[ERROR] Timeout al conectar o recibir del Tracker para solicitar '{file_name}'.")
+        return []
     except ConnectionRefusedError:
         print(f"[ERROR] No se pudo conectar al Tracker en {tracker_ip}:{tracker_port} para solicitar el archivo.")
         return []
@@ -99,9 +109,10 @@ def request_all_files_from_tracker():
     tracker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     all_available_files = {}
     try:
+        tracker.settimeout(5) # Añadir timeout
         tracker.connect((tracker_ip, tracker_port))
         tracker.send(b"LIST_ALL_FILES")
-        response = tracker.recv(8192).decode() # Aumentar buffer para muchos archivos
+        response = tracker.recv(8192).decode('utf-8')
         if response.startswith("ERROR"):
             print(f"[ERROR] Tracker devolvió error al listar archivos: {response}")
             return {}
@@ -114,6 +125,9 @@ def request_all_files_from_tracker():
                     node_ids = node_ids_str.split(",")
                     all_available_files[file_name] = node_ids
         return all_available_files
+    except socket.timeout:
+        print(f"[ERROR] Timeout al conectar o recibir del Tracker para listar archivos.")
+        return {}
     except ConnectionRefusedError:
         print(f"[ERROR] No se pudo conectar al Tracker en {tracker_ip}:{tracker_port} para listar archivos.")
         return {}
@@ -129,7 +143,7 @@ def handle_peer_connection(peer_socket):
     """
     peer_addr = peer_socket.getpeername()
     try:
-        data = peer_socket.recv(1024).decode()
+        data = peer_socket.recv(1024).decode('utf-8')
         if data.startswith("GET_SIZE"):
             _, file_name = data.split(":")
             print(f"[PEER_SERVER] Recibida solicitud GET_SIZE para '{file_name}' de {peer_addr}")
@@ -140,7 +154,7 @@ def handle_peer_connection(peer_socket):
             send_file_fragment(peer_socket, file_name, int(start), int(end))
         else:
             print(f"[ERROR] Comando no reconocido de {peer_addr}: {data}")
-            peer_socket.send(b"ERROR: Comando no reconocido.")
+            peer_socket.send("ERROR: Comando no reconocido.".encode('utf-8'))
     except ConnectionResetError:
         print(f"[WARNING] Conexión con {peer_addr} reseteada por el cliente.")
     except Exception as e:
@@ -157,14 +171,14 @@ def send_file_size(peer_socket, file_name):
         file_path = os.path.join(current_dir, "peers", file_name)
         if not os.path.exists(file_path):
             print(f"[ERROR_SHARE] El archivo '{file_name}' no existe localmente en {file_path}.")
-            peer_socket.send(b"ERROR: Archivo no encontrado.")
+            peer_socket.send("ERROR: Archivo no encontrado.".encode('utf-8'))
             return
         file_size = os.path.getsize(file_path)
-        peer_socket.send(f"SIZE:{file_size}".encode())
+        peer_socket.send(f"SIZE:{file_size}".encode('utf-8'))
         print(f"[DEBUG_SHARE] Tamaño de '{file_name}' enviado: {file_size} bytes.")
     except Exception as e:
         print(f"[ERROR_SHARE] Error al enviar tamaño de archivo '{file_name}': {e}")
-        peer_socket.send(b"ERROR: Error inesperado al obtener tamanio.")
+        peer_socket.send("ERROR: Error inesperado al obtener tamaño.".encode('utf-8')) # Corregido: encode('utf-8')
 
 def send_file_fragment(peer_socket, file_name, start, end):
     """
@@ -175,7 +189,7 @@ def send_file_fragment(peer_socket, file_name, start, end):
         file_path = os.path.join(current_dir, "peers", file_name)
         if not os.path.exists(file_path):
             print(f"[ERROR_SHARE] El archivo '{file_name}' no existe localmente en {file_path} para enviar fragmento.")
-            peer_socket.send(b"ERROR: Archivo no encontrado para fragmento.")
+            peer_socket.send("ERROR: Archivo no encontrado para fragmento.".encode('utf-8'))
             return
         with open(file_path, "rb") as f:
             f.seek(start)
@@ -183,7 +197,7 @@ def send_file_fragment(peer_socket, file_name, start, end):
             total_sent = 0
             while bytes_to_read > 0:
                 chunk = f.read(min(CHUNK_SIZE, bytes_to_read))
-                if not chunk: # End of file reached prematurely or empty chunk
+                if not chunk:
                     break
                 peer_socket.send(chunk)
                 bytes_to_read -= len(chunk)
@@ -192,7 +206,7 @@ def send_file_fragment(peer_socket, file_name, start, end):
             print(f"[DEBUG_SHARE] Enviado fragmento {start}-{end} ({total_sent} bytes) de '{file_name}'.")
     except Exception as e:
         print(f"[ERROR_SHARE] Error al enviar fragmento {start}-{end} de '{file_name}': {e}")
-        peer_socket.send(b"ERROR: Error inesperado al enviar fragmento.")
+        peer_socket.send("ERROR: Error inesperado al enviar fragmento.".encode('utf-8'))
 
 def save_progress(file_name, fragments):
     """
@@ -218,9 +232,26 @@ def save_progress(file_name, fragments):
         with open(full_progress_file_path, "w") as f:
             json.dump(progress_data, f, indent=4)
 
-        print(f"[INFO_PROGRESS] Progreso guardado para '{file_name}' en {full_progress_file_path}.")
+        # print(f"[INFO_PROGRESS] Progreso guardado para '{file_name}' en {full_progress_file_path}.") # Menos verbose
     except Exception as e:
         print(f"[ERROR_PROGRESS] No se pudo guardar el progreso para '{file_name}': {e}")
+
+def _save_full_progress_data(full_progress_dict):
+    """
+    Guarda el diccionario completo de progreso en el archivo progress.json.
+    Esta es una función interna, marcada con un guion bajo.
+    """
+    try:
+        peers_dir = os.path.join(os.getcwd(), "peers")
+        if not os.path.exists(peers_dir):
+            os.makedirs(peers_dir)
+        full_progress_file_path = os.path.join(peers_dir, progress_file)
+        
+        with open(full_progress_file_path, "w") as f:
+            json.dump(full_progress_dict, f, indent=4)
+        # print(f"[INFO_PROGRESS] Archivo de progreso general guardado en {full_progress_file_path}.") # Menos verbose
+    except Exception as e:
+        print(f"[ERROR_PROGRESS] No se pudo guardar el archivo de progreso general: {e}")
 
 def load_progress():
     """
@@ -245,9 +276,10 @@ def get_file_size(peer_ip, peer_port, file_name):
     """
     try:
         peer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        peer.settimeout(10)
         peer.connect((peer_ip, peer_port))
-        peer.send(f"GET_SIZE:{file_name}".encode())
-        response = peer.recv(1024).decode()
+        peer.send(f"GET_SIZE:{file_name}".encode('utf-8'))
+        response = peer.recv(1024).decode('utf-8')
         peer.close()
         if response.startswith("SIZE:"):
             return int(response.split(":")[1])
@@ -257,6 +289,9 @@ def get_file_size(peer_ip, peer_port, file_name):
         else:
             print(f"[ERROR_DOWNLOAD] Respuesta inesperada del peer {peer_ip}:{peer_port} al solicitar tamaño: {response}")
             return None
+    except socket.timeout:
+        print(f"[ERROR_DOWNLOAD] Timeout al conectar o recibir de {peer_ip}:{peer_port} para '{file_name}'.")
+        return None
     except ConnectionRefusedError:
         print(f"[ERROR_DOWNLOAD] No se pudo conectar al peer {peer_ip}:{peer_port}. Podría estar offline o su puerto no está abierto.")
         return None
@@ -269,11 +304,11 @@ def download_file_simultaneously(file_name):
     Descarga un archivo completo desde múltiples nodos simultáneamente.
     """
     print(f"\n[DOWNLOAD_MANAGER] Iniciando descarga de '{file_name}'...")
-    progress = load_progress()
-    fragments_status = progress.get(file_name, {})
+    progress_from_disk = load_progress() # Cargar el progreso guardado en disco
+    fragments_status = progress_from_disk.get(file_name, {})
 
     peers_available = request_file(file_name)
-    peers_available = [p for p in peers_available if p and len(p.split(':')) == 3] # Limpiar y validar
+    peers_available = [p for p in peers_available if p and len(p.split(':')) == 3]
     
     if not peers_available:
         print(f"[DOWNLOAD_MANAGER] No hay peers disponibles con el archivo '{file_name}'. Descarga cancelada.")
@@ -296,7 +331,16 @@ def download_file_simultaneously(file_name):
         return
 
     num_fragments = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    print(f"[DOWNLOAD_MANAGER] '{file_name}' ({file_size} bytes) se dividirá en {num_fragments} fragmentos.")
+    
+    # NUEVA: Inicializar o actualizar el progreso global para el menú
+    with active_downloads_progress:
+        global_download_status[file_name] = {
+            "total_fragments": num_fragments,
+            "completed_fragments": 0,
+            "total_size": file_size,
+            "downloaded_size": 0,
+            "status": "Iniciando..."
+        }
 
     all_fragments_info = []
     for i in range(num_fragments):
@@ -309,18 +353,28 @@ def download_file_simultaneously(file_name):
             "end": end,
             "status": fragments_status.get(fragment_id, "pending")
         })
+        # Si ya estaba completo desde una sesión anterior, actualizar el contador para el progreso mostrado
+        if fragments_status.get(fragment_id) == "complete":
+            with active_downloads_progress:
+                global_download_status[file_name]["completed_fragments"] += 1
+                global_download_status[file_name]["downloaded_size"] += (end - start + 1) # Aproximado, el último puede ser más pequeño
 
     pending_fragments = [f for f in all_fragments_info if f["status"] == "pending"]
     if not pending_fragments:
         print(f"[DOWNLOAD_MANAGER] El archivo '{file_name}' ya está completamente descargado. Verificando combinación...")
+        with active_downloads_progress:
+            global_download_status[file_name]["status"] = "Completado (Verificando...)"
         combine_fragments(file_name, all_fragments_info)
+        with active_downloads_progress:
+            if file_name in global_download_status: # Si la combinación lo eliminó
+                del global_download_status[file_name]
         return
 
     print(f"[DOWNLOAD_MANAGER] Quedan {len(pending_fragments)} fragmentos por descargar.")
+    with active_downloads_progress:
+        global_download_status[file_name]["status"] = "Descargando..."
 
     download_threads = []
-    
-    # Asignar fragmentos a peers disponibles (simple round-robin)
     peer_index = 0
     for frag_info in pending_fragments:
         if not peers_available:
@@ -341,7 +395,7 @@ def download_file_simultaneously(file_name):
         thread = threading.Thread(
             target=download_fragment,
             args=(peer_ip, peer_port, file_name, frag_info['start'], frag_info['end'],
-                  fragment_path, frag_info['id'], fragments_status)
+                  fragment_path, frag_info['id'], fragments_status, global_download_status, active_downloads_progress)
         )
         download_threads.append(thread)
         thread.start()
@@ -361,54 +415,70 @@ def download_file_simultaneously(file_name):
     
     if all_downloaded:
         print(f"[DOWNLOAD_MANAGER] Todos los fragmentos de '{file_name}' han sido descargados.")
+        with active_downloads_progress:
+            global_download_status[file_name]["status"] = "Combinando..."
         combine_fragments(file_name, all_fragments_info)
+        with active_downloads_progress:
+            if file_name in global_download_status:
+                del global_download_status[file_name]
     else:
         print(f"[DOWNLOAD_MANAGER] La descarga de '{file_name}' no se completó. Algunos fragmentos no pudieron ser obtenidos. Reintenta más tarde.")
-        save_progress(file_name, fragments_status) # Guardar el estado actual incluso si incompleto
+        save_progress(file_name, fragments_status)
+        with active_downloads_progress:
+            global_download_status[file_name]["status"] = "Incompleto"
 
 
-def download_fragment(peer_ip, peer_port, file_name, start, end, fragment_path, fragment_id, fragments_status):
+def download_fragment(peer_ip, peer_port, file_name, start, end, fragment_path, fragment_id, fragments_status, global_status_dict, lock):
     """
     Descarga un fragmento específico de un archivo desde un peer.
     """
+    bytes_received_in_fragment = 0
     try:
         peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        peer_socket.settimeout(10) # Set a timeout for connection and recv operations
+        peer_socket.settimeout(10)
         peer_socket.connect((peer_ip, peer_port))
-        peer_socket.send(f"DOWNLOAD:{file_name}:{start}:{end}".encode())
+        peer_socket.send(f"DOWNLOAD:{file_name}:{start}:{end}".encode('utf-8')) # Corregido: encode('utf-8')
         
-        received_bytes = 0
         expected_bytes = (end - start + 1)
         
         with open(fragment_path, "wb") as f:
-            while received_bytes < expected_bytes:
+            while bytes_received_in_fragment < expected_bytes:
                 data = peer_socket.recv(CHUNK_SIZE)
-                if not data: # Connection closed by peer prematurely
+                if not data:
                     print(f"[ERROR_FRAGMENT] Peer {peer_ip}:{peer_port} cerró la conexión antes de completar el fragmento {fragment_id} de '{file_name}'.")
                     break
-                if data == b"DONE": # Peer signaled end of fragment
-                    print(f"[DEBUG_FRAGMENT] Recibido 'DONE' para fragmento {fragment_id} de '{file_name}'.")
+                if data == b"DONE": # Se recibió la señal de finalización, pero puede ser prematura
                     break
-                if data.startswith(b"ERROR"): # Peer sent an error message
-                    error_msg = data.decode()
+                if data.startswith(b"ERROR"):
+                    error_msg = data.decode('utf-8') # Corregido: decode('utf-8')
                     print(f"[ERROR_FRAGMENT] Peer {peer_ip}:{peer_port} devolvió error al descargar fragmento {fragment_id} de '{file_name}': {error_msg}")
                     break
                 
                 f.write(data)
-                received_bytes += len(data)
+                bytes_received_in_fragment += len(data)
+                
+                # NUEVA: Actualizar progreso global en cada chunk recibido
+                with lock:
+                    if file_name in global_status_dict:
+                        global_status_dict[file_name]["downloaded_size"] += len(data)
+
         peer_socket.close()
 
-        if received_bytes >= expected_bytes:
+        if bytes_received_in_fragment >= expected_bytes:
             fragments_status[fragment_id] = "complete"
             save_progress(file_name, fragments_status)
-            print(f"[DEBUG_FRAGMENT] Fragmento {fragment_id} de '{file_name}' descargado y verificado ({received_bytes}/{expected_bytes} bytes).")
+            print(f"[DEBUG_FRAGMENT] Fragmento {fragment_id} de '{file_name}' descargado y verificado ({bytes_received_in_fragment}/{expected_bytes} bytes).")
+            
+            # NUEVA: Incrementar contador de fragmentos completos
+            with lock:
+                if file_name in global_status_dict:
+                    global_status_dict[file_name]["completed_fragments"] += 1
+
         else:
-            print(f"[WARNING_FRAGMENT] Fragmento {fragment_id} de '{file_name}' de {peer_ip}:{peer_port} no se descargó completamente (Esperado: {expected_bytes}, Recibido: {received_bytes}). Marcado como pendiente.")
-            # Asegurarse de que no se marca como completo si no se recibió todo
-            if fragments_status.get(fragment_id) == "complete":
-                del fragments_status[fragment_id] # Eliminar estado completo si fue parcial
-            save_progress(file_name, fragments_status) # Actualizar el progreso con estado pendiente
-            # Limpiar el archivo parcial si está incompleto para reintentar desde cero
+            print(f"[WARNING_FRAGMENT] Fragmento {fragment_id} de '{file_name}' de {peer_ip}:{peer_port} no se descargó completamente (Esperado: {expected_bytes}, Recibido: {bytes_received_in_fragment}). Marcado como pendiente.")
+            if fragments_status.get(fragment_id) == "complete": # Si ya estaba completo, invalidarlo
+                del fragments_status[fragment_id]
+            save_progress(file_name, fragments_status)
             try:
                 os.remove(fragment_path)
                 print(f"[INFO_FRAGMENT] Eliminado fragmento incompleto {fragment_path} para reintento.")
@@ -429,7 +499,6 @@ def combine_fragments(file_name, all_fragments_info):
     peers_dir = os.path.join(os.getcwd(), "peers")
     combined_path = os.path.join(peers_dir, f"downloaded_{file_name}")
     
-    # Ordenar los fragmentos por su rango inicial para combinarlos correctamente
     all_fragments_info.sort(key=lambda x: x['start'])
 
     try:
@@ -439,16 +508,17 @@ def combine_fragments(file_name, all_fragments_info):
                 if os.path.exists(fragment_path):
                     with open(fragment_path, "rb") as infile:
                         outfile.write(infile.read())
-                    os.remove(fragment_path) # Eliminar el fragmento después de combinar
+                    os.remove(fragment_path)
                 else:
                     print(f"[WARNING] Fragmento {fragment_path} no encontrado para combinar. El archivo final podría estar incompleto.")
         print(f"[INFO_COMBINE] Archivo '{file_name}' descargado y combinado correctamente en {combined_path}.")
-        # Opcional: Eliminar la entrada de progreso del archivo una vez combinado completamente
-        progress = load_progress()
-        if file_name in progress:
-            del progress[file_name]
-            save_progress(file_name, progress) # Guardar el progreso sin el archivo completo
-            print(f"[INFO_COMBINE] Progreso de '{file_name}' eliminado.")
+        
+        current_overall_progress = load_progress()
+        if file_name in current_overall_progress:
+            del current_overall_progress[file_name]
+            _save_full_progress_data(current_overall_progress)
+            print(f"[INFO_COMBINE] Progreso de '{file_name}' eliminado del registro.")
+            
     except Exception as e:
         print(f"[ERROR_COMBINE] Error al combinar los fragmentos de '{file_name}': {e}")
 
@@ -458,7 +528,7 @@ def start_node_server(node_port):
     Inicia un servidor para escuchar solicitudes entrantes desde otros nodos.
     """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Permite reusar la dirección rápidamente
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server.bind(("0.0.0.0", node_port))
         server.listen(5)
@@ -468,11 +538,11 @@ def start_node_server(node_port):
             peer_socket, addr = server.accept()
             threading.Thread(target=handle_peer_connection, args=(peer_socket,)).start()
     except OSError as e:
-        if e.errno == 98: # Address already in use
+        if e.errno == 98:
             print(f"[CRITICAL ERROR] El puerto {node_port} ya está en uso. Por favor, especifique un puerto diferente.")
         else:
             print(f"[CRITICAL ERROR] Error al iniciar el servidor del nodo en el puerto {node_port}: {e}")
-        sys.exit(1) # Salir si el servidor no puede iniciarse
+        sys.exit(1)
     except Exception as e:
         print(f"[CRITICAL ERROR] Error inesperado al iniciar el servidor del nodo: {e}")
         sys.exit(1)
@@ -495,7 +565,6 @@ def share_new_file():
     peers_dir = os.path.join(os.getcwd(), "peers")
     destination_path = os.path.join(peers_dir, file_name)
 
-    # Solo copiar si el archivo no está ya en la carpeta 'peers'
     if os.path.abspath(file_path_input) != os.path.abspath(destination_path):
         try:
             shutil.copy(file_path_input, destination_path)
@@ -508,11 +577,83 @@ def share_new_file():
 
     if file_name not in current_shared_files:
         current_shared_files.append(file_name)
-        save_shared_files(current_shared_files) # Guardar la lista actualizada en el archivo de persistencia
+        save_shared_files(current_shared_files)
         print(f"[INFO_SHARE_MENU] Registrando '{file_name}' con el Tracker...")
         register_with_tracker(current_node_id, current_node_port, current_shared_files)
     else:
         print(f"[INFO_SHARE_MENU] '{file_name}' ya está siendo compartido.")
+
+# NUEVA FUNCIÓN: Eliminar/Dejar de Compartir Archivos
+def manage_shared_files():
+    """
+    Permite al usuario dejar de compartir o eliminar un archivo.
+    """
+    global current_shared_files, current_node_id, current_node_port
+
+    if not current_shared_files:
+        print("[INFO] No estás compartiendo ningún archivo actualmente.")
+        return
+
+    while True:
+        print("\n--- Gestionar Archivos Compartidos ---")
+        for i, file_name in enumerate(current_shared_files):
+            file_path_in_peers = os.path.join(os.getcwd(), "peers", file_name)
+            status = " (Existe físicamente)" if os.path.exists(file_path_in_peers) else " (NO existe físicamente)"
+            print(f"[{i+1}] {file_name}{status}")
+        print("[R] Regresar al menú anterior")
+
+        choice = input("Introduce el número del archivo a gestionar, o 'r' para regresar: ").strip().lower()
+
+        if choice == 'r':
+            return
+
+        try:
+            index = int(choice) - 1
+            if 0 <= index < len(current_shared_files):
+                file_to_manage = current_shared_files[index]
+                
+                print(f"\n¿Qué deseas hacer con '{file_to_manage}'?")
+                print("1. Dejar de compartir (eliminar solo del registro y tracker)")
+                print("2. Eliminar completamente (dejar de compartir y borrar archivo físico)")
+                print("[R] Regresar")
+
+                sub_choice = input("Elige una opción: ").strip().lower()
+
+                if sub_choice == '1':
+                    current_shared_files.pop(index)
+                    save_shared_files(current_shared_files)
+                    print(f"[INFO] '{file_to_manage}' ha sido eliminado de tu lista de archivos compartidos.")
+                    register_with_tracker(current_node_id, current_node_port, current_shared_files)
+                    print(f"[INFO] Tracker actualizado: '{file_to_manage}' ya no es compartido por {current_node_id}.")
+                    return
+                elif sub_choice == '2':
+                    file_path_in_peers = os.path.join(os.getcwd(), "peers", file_to_manage)
+                    if os.path.exists(file_path_in_peers):
+                        try:
+                            os.remove(file_path_in_peers)
+                            print(f"[INFO] Archivo físico '{file_to_manage}' eliminado de la carpeta 'peers'.")
+                        except OSError as e:
+                            print(f"[ERROR] No se pudo eliminar el archivo físico '{file_to_manage}': {e}")
+                    else:
+                        print(f"[WARNING] El archivo físico '{file_to_manage}' no se encontró en la carpeta 'peers'.")
+
+                    current_shared_files.pop(index)
+                    save_shared_files(current_shared_files)
+                    print(f"[INFO] '{file_to_manage}' ha sido eliminado completamente.")
+                    register_with_tracker(current_node_id, current_node_port, current_shared_files)
+                    print(f"[INFO] Tracker actualizado: '{file_to_manage}' ya no es compartido por {current_node_id}.")
+                    return
+                elif sub_choice == 'r':
+                    continue
+                else:
+                    print("[ERROR] Opción inválida.")
+            else:
+                print("[ERROR] Número fuera de rango. Por favor, elige un número válido.")
+        except ValueError:
+            print("[ERROR] Opción inválida. Introduce un número o 'r'.")
+        except Exception as e:
+            print(f"[ERROR] Error al gestionar archivo: {e}")
+
 
 # Función para mostrar los archivos disponibles y permitir la selección para descargar
 def download_menu():
@@ -520,6 +661,15 @@ def download_menu():
     Muestra los archivos disponibles en la red y permite al usuario elegir uno para descargar.
     """
     while True:
+        # Mostrar progreso de descargas activas en la parte superior del menú
+        with active_downloads_progress:
+            if global_download_status:
+                print("\n--- Progreso de Descargas Activas ---")
+                for file_name, status_info in global_download_status.items():
+                    progress_percent = (status_info["downloaded_size"] / status_info["total_size"]) * 100 if status_info["total_size"] > 0 else 0
+                    print(f"  {file_name}: {progress_percent:.2f}% ({status_info['downloaded_size']} / {status_info['total_size']} bytes) - {status_info['status']}")
+                print("---------------------------------------")
+
         print("\n--- Archivos Disponibles para Descargar ---")
         
         available_files_from_tracker = request_all_files_from_tracker()
@@ -534,54 +684,31 @@ def download_menu():
                 print("[ERROR_DOWNLOAD_MENU] Opción inválida.")
                 continue
 
-        # Convertir el diccionario de archivos a una lista ordenada para mostrar
         file_names_list = sorted(available_files_from_tracker.keys())
         
         for i, file_name in enumerate(file_names_list):
             nodes_sharing = available_files_from_tracker[file_name]
-            print(f"[{i+1}] {file_name} (Compartido por: {', '.join(sorted(nodes_sharing))})") # Ordenar por nodo para consistencia
+            downloaded_file_path = os.path.join(os.getcwd(), "peers", f"downloaded_{file_name}")
+            status_suffix = " (Descargado)" if os.path.exists(downloaded_file_path) else ""
+            
+            print(f"[{i+1}] {file_name}{status_suffix} (Compartido por: {', '.join(sorted(nodes_sharing))})")
         
         print("[R] Regresar al menú anterior")
         
         choice = input("Introduce el número del archivo que deseas descargar (o 'r' para regresar): ").strip().lower()
         
         if choice == 'r':
-            return # Regresar al menú principal
+            return
         
         try:
             index = int(choice) - 1
             if 0 <= index < len(file_names_list):
                 file_to_download = file_names_list[index]
-                # Antes de descargar, verificar si el archivo ya está descargado y combinado
-                downloaded_file_path = os.path.join(os.getcwd(), "peers", f"downloaded_{file_to_download}")
-                if os.path.exists(downloaded_file_path):
-                    print(f"[INFO_DOWNLOAD_MENU] El archivo '{file_to_download}' ya parece estar descargado en '{downloaded_file_path}'.")
-                    # Ofrecer re-descargar o simplemente regresar
-                    re_download = input("¿Deseas intentar descargarlo de nuevo? (s/n): ").strip().lower()
-                    if re_download != 's':
-                        continue # Volver al menú de descarga
-                    else:
-                        # Si decide re-descargar, limpiar el progreso anterior
-                        progress = load_progress()
-                        if file_to_download in progress:
-                            del progress[file_to_download]
-                            save_progress(file_to_download, progress)
-                            print(f"[INFO_DOWNLOAD_MENU] Limpiado progreso anterior para '{file_to_download}'.")
-                        # También eliminar archivos parciales existentes para evitar conflictos
-                        for f_name in os.listdir(os.path.join(os.getcwd(), "peers")):
-                            if f_name.startswith(f"{file_to_download}.part"):
-                                try:
-                                    os.remove(os.path.join(os.getcwd(), "peers", f_name))
-                                    print(f"[INFO_DOWNLOAD_MENU] Eliminado fragmento antiguo: {f_name}")
-                                except OSError as e:
-                                    print(f"[WARNING_DOWNLOAD_MENU] No se pudo eliminar fragmento antiguo {f_name}: {e}")
-
-
-                print(f"[INFO_DOWNLOAD_MENU] Iniciando descarga de '{file_to_download}'...")
-                # La función download_file_simultaneously se encargará de encontrar los peers
-                # y descargar los fragmentos.
+                
+                # Ya no es necesario preguntar si quiere re-descargar aquí, download_file_simultaneously lo maneja.
+                print(f"[INFO_DOWNLOAD_MENU] Iniciando proceso de descarga para '{file_to_download}'...")
                 download_file_simultaneously(file_to_download)
-                return # Regresar al menú principal después de intentar descargar
+                # El bucle while True en download_menu lo mantiene aquí hasta que elija 'r'.
             else:
                 print("[ERROR_DOWNLOAD_MENU] Número fuera de rango. Por favor, elige un número válido.")
         except ValueError:
@@ -602,11 +729,11 @@ if __name__ == "__main__":
     try:
         tracker_ip = sys.argv[1]
         tracker_port = int(sys.argv[2])
-        current_node_id = sys.argv[3] # Asignar a la global
-        current_node_port = int(sys.argv[4]) # Asignar a la global
+        current_node_id = sys.argv[3]
+        current_node_port = int(sys.argv[4])
         
         initial_shared_files_from_args = []
-        if len(sys.argv) > 5 and sys.argv[5] != "''": # Permite pasar '' para shared_files vacíos
+        if len(sys.argv) > 5 and sys.argv[5] != "''":
             initial_shared_files_str = sys.argv[5]
             initial_shared_files_from_args = [f.strip() for f in initial_shared_files_str.split(',') if f.strip()]
 
@@ -621,19 +748,15 @@ if __name__ == "__main__":
         print(f"[ERROR] Error al parsear argumentos: {e}")
         sys.exit(1)
         
-    # Crear la carpeta 'peers' si no existe
     peers_dir = os.path.join(os.getcwd(), "peers")
     if not os.path.exists(peers_dir):
         os.makedirs(peers_dir)
         print(f"[INFO] Creada la carpeta de peers: {peers_dir}")
 
-    # Cargar los archivos compartidos existentes (persistencia)
     current_shared_files = load_shared_files()
     
-    # Combinar archivos iniciales de argumentos con archivos persistentes
     for file_name in initial_shared_files_from_args:
         if file_name not in current_shared_files:
-            # Verificar si el archivo existe físicamente en la carpeta 'peers' antes de agregarlo
             file_path_in_peers = os.path.join(peers_dir, file_name)
             if os.path.exists(file_path_in_peers):
                 current_shared_files.append(file_name)
@@ -641,36 +764,35 @@ if __name__ == "__main__":
             else:
                 print(f"[WARNING] El archivo '{file_name}' (especificado en argumentos) no existe en la carpeta '{peers_dir}'. No se registrará.")
 
-    save_shared_files(current_shared_files) # Guardar la lista consolidada (persistencia + argumentos válidos)
+    save_shared_files(current_shared_files)
 
     print(f"[INFO] Archivos compartidos iniciales del nodo: {current_shared_files if current_shared_files else 'Ninguno'}")
 
-
-    # Inicia el servidor del nodo en un hilo separado
     threading.Thread(target=start_node_server, args=(current_node_port,), daemon=True).start()
-    time.sleep(0.5) # Pequeña pausa para asegurar que el servidor se esté levantando
+    time.sleep(0.5)
 
-    # Registra el nodo con el Tracker con la lista consolidada de archivos
     register_with_tracker(current_node_id, current_node_port, current_shared_files)
 
-    # Bucle principal de menú interactivo
     while True:
         print("\n--- Menú Principal del Nodo ---")
         print("1. Compartir un archivo (subir)")
         print("2. Descargar un archivo")
-        print("3. Salir")
+        print("3. Gestionar archivos compartidos") # NUEVA OPCIÓN
+        print("4. Salir")
         
         main_choice = input("Elige una opción: ").strip()
 
         if main_choice == '1':
-            share_new_file() # Ahora no necesita pasar argumentos, usa las globales
+            share_new_file()
         elif main_choice == '2':
-            download_menu() # Ahora no necesita pasar argumentos, usa las globales
+            download_menu()
         elif main_choice == '3':
+            manage_shared_files()
+        elif main_choice == '4':
             print(f"[INFO] {current_node_id} saliendo...")
             break
         else:
-            print("[ERROR] Opción inválida. Por favor, elige 1, 2 o 3.")
+            print("[ERROR] Opción inválida. Por favor, elige 1, 2, 3 o 4.")
 
     print("[INFO] Programa del nodo finalizado.")
     sys.exit(0)
